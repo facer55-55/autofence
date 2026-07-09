@@ -7,14 +7,49 @@ import pandas as pd
 import streamlit as st
 
 import hesaplama
+import teklif_pdf
 importlib.reload(hesaplama)
+importlib.reload(teklif_pdf)
 from hesaplama import hesapla_coklu_maliyet
 from kolon_map import ayak_kaydini_map_et, urun_kaydini_map_et
 from database import KOLONLAR, ornek_veri_yukle, tip_urunleri_getir, toplu_guncelle, tum_urunleri_getir, urun_kaydi_getir
 from dosya_okuma import DosyaOkumaHatasi, dosya_oku, metin_oku
+from teklif_pdf import PDF_SABLON_SURUM, olustur_teklif_pdf, teklif_dosya_adi
 
-UYGULAMA_SURUM = "17.0"
+UYGULAMA_SURUM = "19.0"
 DIREK_ARALIKLARI = ["1.00", "1.5", "1.56", "2.00", "2.5", "3.00"]
+
+OTURUM_ANAHTARLARI = (
+    "hesap_sonuc",
+    "pdf_bytes",
+    "pdf_musteri",
+    "pdf_sablon_surum",
+    "onizleme_df",
+    "onizleme_bilgi",
+)
+
+
+def oturum_gecmisini_temizle() -> None:
+    """Hesap, PDF ve yönetim önizleme geçmişini siler."""
+    for anahtar in OTURUM_ANAHTARLARI:
+        st.session_state.pop(anahtar, None)
+
+
+def surum_kontrolu_yap() -> None:
+    """Sürüm değiştiyse tüm oturum geçmişini sıfırlar."""
+    if st.session_state.get("app_surum") == UYGULAMA_SURUM:
+        return
+    oturum_gecmisini_temizle()
+    st.session_state["app_surum"] = UYGULAMA_SURUM
+
+
+def pdf_onbellek_temizle() -> None:
+    """Eski PDF şablonu önbelleğini siler."""
+    if st.session_state.get("pdf_sablon_surum") == PDF_SABLON_SURUM:
+        return
+    st.session_state.pop("pdf_bytes", None)
+    st.session_state.pop("pdf_musteri", None)
+    st.session_state["pdf_sablon_surum"] = PDF_SABLON_SURUM
 
 
 def urun_etiketi_olustur(kayit: dict) -> str:
@@ -145,36 +180,52 @@ def kullanici_sayfasi() -> None:
         key="uzunluk_editor",
     )
 
-    if not st.button("Hesapla", type="primary"):
-        return
+    hesapla_tiklandi = st.button("Hesapla", type="primary")
 
     uygulama_uzunluklar = [
         float(v)
         for v in uzunluk_df["uygulama_uzunluk (m)"].dropna().tolist()
         if float(v) > 0
     ]
-    if not uygulama_uzunluklar:
-        st.error("En az bir geçerli uygulama_uzunluk girin.")
+
+    if hesapla_tiklandi:
+        if not uygulama_uzunluklar:
+            st.error("En az bir geçerli uygulama_uzunluk girin.")
+            return
+        try:
+            sonuc = hesapla_coklu_maliyet(
+                uygulama_uzunluklar=uygulama_uzunluklar,
+                uygulama_aralik=uygulama_aralik,
+                urun_en=urun_map["urun_en"],
+                urun_boy=urun_map["urun_boy"],
+                urun_fiyat=urun_map["urun_fiyat"],
+                montaj_fiyat=urun_map["montaj_fiyat"],
+                ayak_boy=ayak_map["ayak_boy"],
+                ayak_fiyat=ayak_map["ayak_fiyat"],
+            )
+            st.session_state["hesap_sonuc"] = {
+                "sonuc": sonuc,
+                "uygulama_urun": uygulama_urun,
+                "uygulama_ayak": uygulama_ayak,
+                "uygulama_aralik": uygulama_aralik,
+            }
+            st.session_state.pop("pdf_bytes", None)
+            st.session_state.pop("pdf_musteri", None)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+    if "hesap_sonuc" not in st.session_state:
         return
 
-    try:
-        sonuc = hesapla_coklu_maliyet(
-            uygulama_uzunluklar=uygulama_uzunluklar,
-            uygulama_aralik=uygulama_aralik,
-            urun_en=urun_map["urun_en"],
-            urun_boy=urun_map["urun_boy"],
-            urun_fiyat=urun_map["urun_fiyat"],
-            montaj_fiyat=urun_map["montaj_fiyat"],
-            ayak_boy=ayak_map["ayak_boy"],
-            ayak_fiyat=ayak_map["ayak_fiyat"],
-        )
-    except ValueError as exc:
-        st.error(str(exc))
-        return
+    kayitli = st.session_state["hesap_sonuc"]
+    sonuc = kayitli["sonuc"]
+    uygulama_urun = kayitli["uygulama_urun"]
+    uygulama_ayak = kayitli["uygulama_ayak"]
+    uygulama_aralik = kayitli["uygulama_aralik"]
 
     st.subheader("Hesap Sonuçları")
     st.caption(f"uygulama_urun: {uygulama_urun} · uygulama_ayak: {uygulama_ayak}")
-    st.metric("Panjursayısı", f"{sonuc.panjur_sayisi:,.2f}")
 
     satir_tablosu = pd.DataFrame(
         [
@@ -206,12 +257,56 @@ def kullanici_sayfasi() -> None:
 
     st.metric("Toplam Ücret (₺)", f"{sonuc.toplam_ucret:,.2f}")
 
+    st.subheader("5. PDF Teklif Formu")
+    musteri_adi = st.text_input(
+        "Müşteri adı",
+        placeholder="Firma veya kişi adını girin",
+        key="musteri_adi",
+    )
+    pdf_olustur = st.button("PDF Teklif Oluştur", type="secondary", key="pdf_olustur")
+    if pdf_olustur:
+        if not musteri_adi.strip():
+            st.error("Lütfen müşteri adını girin.")
+        else:
+            try:
+                pdf_bytes = olustur_teklif_pdf(
+                    musteri_adi=musteri_adi.strip(),
+                    uygulama_urun=uygulama_urun,
+                    uygulama_ayak=uygulama_ayak,
+                    uygulama_aralik=uygulama_aralik,
+                    sonuc=sonuc,
+                )
+                st.session_state["pdf_bytes"] = pdf_bytes
+                st.session_state["pdf_musteri"] = musteri_adi.strip()
+                st.session_state["pdf_sablon_surum"] = PDF_SABLON_SURUM
+            except Exception as exc:
+                st.error(f"PDF oluşturulamadı: {exc}")
+
+    if "pdf_bytes" in st.session_state and st.session_state.get(
+        "pdf_sablon_surum"
+    ) == PDF_SABLON_SURUM:
+        st.success(f"Teklif hazır: {st.session_state.get('pdf_musteri', '')}")
+        st.download_button(
+            label="Teklifi İndir (PDF)",
+            data=st.session_state["pdf_bytes"],
+            file_name=teklif_dosya_adi(st.session_state.get("pdf_musteri", "musteri")),
+            mime="application/pdf",
+            type="primary",
+            key="pdf_indir",
+        )
+
 
 def main() -> None:
     st.set_page_config(page_title="Malzeme Hesaplama", page_icon="📐", layout="wide")
+    surum_kontrolu_yap()
+    pdf_onbellek_temizle()
     ornek_veri_yukle()
 
     st.sidebar.markdown(f"### Sürüm **{UYGULAMA_SURUM}**")
+    if st.sidebar.button("Geçmişi Temizle", use_container_width=True):
+        oturum_gecmisini_temizle()
+        st.sidebar.success("Geçmiş silindi.")
+        st.rerun()
     sayfa = st.sidebar.radio("Menü", ["Kullanıcı", "Yönetim"])
 
     st.title("Malzeme Hesaplama Uygulaması")

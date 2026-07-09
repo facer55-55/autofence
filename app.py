@@ -1,340 +1,224 @@
-import math
+"""Streamlit — Yönetim ve Kullanıcı panelleri."""
+
+import importlib
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Sabitler
-# ---------------------------------------------------------------------------
-VERI_DOSYASI = Path(__file__).parent / "data" / "urunler.csv"
-KOLONLAR = ["ID", "ADI", "TIP", "BOY", "EN", "BIRIM", "FIYAT", "MONTAJ"]
-DIREK_ARALIK_SECENEKLERI = [1.00, 1.5, 2.00, 2.5, 3.00]
+import hesaplama
+importlib.reload(hesaplama)
+from hesaplama import hesapla_coklu_maliyet
+from kolon_map import ayak_kaydini_map_et, urun_kaydini_map_et
+from database import KOLONLAR, ornek_veri_yukle, tip_urunleri_getir, toplu_guncelle, tum_urunleri_getir, urun_kaydi_getir
+from dosya_okuma import DosyaOkumaHatasi, dosya_oku, metin_oku
+
+UYGULAMA_SURUM = "17.0"
+DIREK_ARALIKLARI = ["1.00", "1.5", "1.56", "2.00", "2.5", "3.00"]
 
 
-# ---------------------------------------------------------------------------
-# Veri katmanı
-# ---------------------------------------------------------------------------
-def urunleri_yukle() -> pd.DataFrame:
-    if VERI_DOSYASI.exists():
-        df = pd.read_csv(VERI_DOSYASI)
-        for kolon in KOLONLAR:
-            if kolon not in df.columns:
-                df[kolon] = None
-        return df[KOLONLAR]
-    return pd.DataFrame(columns=KOLONLAR)
+def urun_etiketi_olustur(kayit: dict) -> str:
+    return f"{kayit['ADI']} — {kayit['BOY']}"
 
 
-def urunleri_kaydet(df: pd.DataFrame) -> None:
-    VERI_DOSYASI.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(VERI_DOSYASI, index=False)
+def urun_secimi_yap(tip: str, etiket: str) -> tuple[str, dict] | tuple[None, None]:
+    urunler = tip_urunleri_getir(tip)
+    if urunler.empty:
+        st.warning(f"{tip} tipinde kayıt yok. Yönetim panelinden liste ekleyin.")
+        return None, None
 
+    adlar = sorted(urunler["ADI"].unique())
+    secilen_ad = st.selectbox(f"{etiket} — Ürün adı", adlar, key=f"ad_{tip}")
 
-def toplu_liste_ayristir(ham_metin: str) -> pd.DataFrame:
-    """Virgül veya sekme ile ayrılmış toplu listeyi DataFrame'e çevirir."""
-    satirlar = [s.strip() for s in ham_metin.strip().splitlines() if s.strip()]
-    if not satirlar:
-        return pd.DataFrame(columns=KOLONLAR)
-
-    kayitlar = []
-    for satir in satirlar:
-        if "\t" in satir:
-            parcalar = satir.split("\t")
-        else:
-            parcalar = [p.strip() for p in satir.split(",")]
-
-        if len(parcalar) < len(KOLONLAR):
-            continue
-
-        kayitlar.append(dict(zip(KOLONLAR, parcalar[: len(KOLONLAR)])))
-
-    df = pd.DataFrame(kayitlar)
-    for kolon in ["ID", "BOY", "EN", "FIYAT", "MONTAJ"]:
-        if kolon in df.columns:
-            df[kolon] = pd.to_numeric(df[kolon], errors="coerce")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Hesaplama fonksiyonları
-# ---------------------------------------------------------------------------
-def hesapla_panjur_sayisi(ayak_boy: float, urun_boy: float) -> float:
-    if urun_boy == 0:
-        return 0.0
-    return ayak_boy / urun_boy
-
-
-def hesapla_direk_sayisi(uygulama_uzunluk: float, uygulama_aralik: float) -> int:
-    if uygulama_aralik == 0:
-        return 0
-    sonuc = uygulama_uzunluk / uygulama_aralik
-    if not sonuc.is_integer():
-        return math.ceil(sonuc) + 1
-    return int(sonuc)
-
-
-def hesapla_urun_sayisi(
-    uygulama_uzunluk: float,
-    urun_en: float,
-    urun_adi: str,
-    panjur_sayisi: float,
-) -> int:
-    if urun_en == 0:
-        return 0
-    uygulama_urun_sayisi = math.ceil(uygulama_uzunluk / urun_en)
-
-    panjur_urunu = (
-        urun_adi == "PANJUR JALUZI 156CM" or "156CM" in urun_adi.upper()
+    boylar = urunler[urunler["ADI"] == secilen_ad]
+    boy_secenekleri = {
+        f"{row['BOY']} (ID:{row['ID']})": int(row["ID"]) for _, row in boylar.iterrows()
+    }
+    secilen_boy = st.selectbox(
+        f"{etiket} — Boy", list(boy_secenekleri.keys()), key=f"boy_{tip}"
     )
-    if panjur_urunu:
-        uygulama_urun_sayisi = int(uygulama_urun_sayisi * panjur_sayisi)
-
-    return uygulama_urun_sayisi
+    kayit = urun_kaydi_getir(boy_secenekleri[secilen_boy])
+    return urun_etiketi_olustur(kayit), kayit
 
 
-def hesapla_iscilik(
-    uygulama_uzunluk: float, urun_boy: float, montaj_fiyat: float
-) -> float:
-    return uygulama_uzunluk * urun_boy * montaj_fiyat
-
-
-def hesapla_malzeme_ucreti(
-    uygulama_urun_sayisi: int,
-    urun_boy: float,
-    urun_en: float,
-    urun_fiyat: float,
-    uygulama_direk_sayisi: int,
-    ayak_fiyat: float,
-) -> float:
-    urun_tutari = uygulama_urun_sayisi * urun_boy * urun_en * urun_fiyat
-    ayak_tutari = uygulama_direk_sayisi * ayak_fiyat
-    return urun_tutari + ayak_tutari
-
-
-def urun_satirindan_map_et(satir: pd.Series) -> dict:
-    """DB kolonlarını (URUN_*) Python değişkenlerine map eder."""
-    return {
-        "urun_fiyat": float(satir["FIYAT"]),      # URUN_FIYAT
-        "montaj_fiyat": float(satir["MONTAJ"]),  # URUN_MONTAJ
-        "urun_en": float(satir["EN"]),           # URUN_EN
-        "urun_boy": float(satir["BOY"]),         # URUN_BOY
-        "urun_adi": str(satir["ADI"]),
-    }
-
-
-def ayak_satirindan_map_et(satir: pd.Series) -> dict:
-    """DB kolonlarını (AYAK_*) Python değişkenlerine map eder."""
-    return {
-        "ayak_fiyat": float(satir["FIYAT"]),  # AYAK_FIYAT
-        "ayak_en": float(satir["EN"]),        # AYAK_EN
-        "ayak_boy": float(satir["BOY"]),      # AYAK_BOY
-        "ayak_adi": str(satir["ADI"]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Yönetim paneli
-# ---------------------------------------------------------------------------
-def yonetim_paneli() -> None:
+def yonetim_sayfasi() -> None:
     st.header("Yönetim Paneli")
-    st.caption("Ürün listesini tablo üzerinden veya toplu liste ile güncelleyebilirsiniz.")
+    st.caption(
+        "Ürün listesi repodaki `ornek_urunler.csv` dosyasından da otomatik yüklenir "
+        "(veritabanı boşsa). CSV'yi güncelleyip GitHub'a push ederseniz Cloud yeniden "
+        "başlayınca yeni liste gelir."
+    )
 
-    if "urun_df" not in st.session_state:
-        st.session_state.urun_df = urunleri_yukle()
+    df = tum_urunleri_getir()
+    st.subheader("Mevcut Liste")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    sekme_tablo, sekme_toplu = st.tabs(["Tablo Düzenle", "Toplu Liste Güncelle"])
+    st.subheader("Toplu Güncelleme")
+    st.markdown("Kolonlar: " + ", ".join(f"`{k}`" for k in KOLONLAR))
+    st.caption("Örnek: `1;PANJUR JALUZI 156CM;ÜRÜN;0,10;156,00;ADET;110,00;55`")
 
-    with sekme_tablo:
-        duzenlenen = st.data_editor(
-            st.session_state.urun_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "ID": st.column_config.NumberColumn("ID", min_value=1, step=1),
-                "ADI": st.column_config.TextColumn("ADI"),
-                "TIP": st.column_config.SelectboxColumn(
-                    "TIP", options=["ÜRÜN", "AYAK"]
-                ),
-                "BOY": st.column_config.NumberColumn("BOY", format="%.2f"),
-                "EN": st.column_config.NumberColumn("EN", format="%.2f"),
-                "BIRIM": st.column_config.TextColumn("BIRIM"),
-                "FIYAT": st.column_config.NumberColumn("FIYAT", format="%.2f"),
-                "MONTAJ": st.column_config.NumberColumn("MONTAJ", format="%.2f"),
-            },
+    yuklenen = st.file_uploader("Dosya (CSV / Excel)", type=["csv", "xlsx", "xls", "txt"])
+    if yuklenen is not None:
+        try:
+            yeni_df, bilgi = dosya_oku(yuklenen)
+            st.session_state["onizleme_df"] = yeni_df
+            st.session_state["onizleme_bilgi"] = bilgi
+        except DosyaOkumaHatasi as exc:
+            st.error(str(exc))
+
+    with st.expander("Metin yapıştır", expanded=False):
+        yapistir = st.text_area("Ürün listesi", height=140, key="metin_yapistir")
+        if st.button("Metni oku", key="metin_oku"):
+            try:
+                yeni_df, bilgi = metin_oku(yapistir)
+                st.session_state["onizleme_df"] = yeni_df
+                st.session_state["onizleme_bilgi"] = bilgi
+            except DosyaOkumaHatasi as exc:
+                st.error(str(exc))
+
+    if "onizleme_df" in st.session_state:
+        onizleme = st.session_state["onizleme_df"]
+        bilgi = st.session_state.get("onizleme_bilgi", "")
+        st.success(f"{len(onizleme)} satır okundu ({bilgi}).")
+        st.dataframe(onizleme, use_container_width=True, hide_index=True)
+        if st.button("Listeyi Güncelle", type="primary"):
+            toplu_guncelle(onizleme)
+            del st.session_state["onizleme_df"]
+            del st.session_state["onizleme_bilgi"]
+            st.success("Kaydedildi.")
+            st.rerun()
+
+    st.subheader("Manuel Düzenleme")
+    duzenlenen = st.data_editor(
+        df if not df.empty else pd.DataFrame(columns=KOLONLAR),
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "TIP": st.column_config.SelectboxColumn("TIP", options=["ÜRÜN", "AYAK"]),
+        },
+    )
+    if st.button("Tabloyu Kaydet"):
+        toplu_guncelle(duzenlenen.dropna(how="all"))
+        st.success("Kaydedildi.")
+        st.rerun()
+
+    ornek_yol = Path(__file__).parent / "ornek_urunler.csv"
+    if ornek_yol.exists():
+        st.download_button(
+            "Örnek CSV indir",
+            ornek_yol.read_text(encoding="utf-8-sig"),
+            "ornek_urunler.csv",
+            "text/csv",
         )
-        if st.button("Tabloyu Kaydet", type="primary", key="tablo_kaydet"):
-            st.session_state.urun_df = duzenlenen
-            urunleri_kaydet(duzenlenen)
-            st.success("Tablo kaydedildi.")
-
-    with sekme_toplu:
-        st.markdown(
-            "Her satır: `ID, ADI, TIP, BOY, EN, BIRIM, FIYAT, MONTAJ` "
-            "(virgül veya sekme ile ayrılmış)"
-        )
-        ornek = (
-            "1,PANJUR JALUZI 156CM,ÜRÜN,1.56,0.15,M2,450.00,85.00\n"
-            "4,DİREK AYAK 2M,AYAK,2.00,0.10,ADET,120.00,0.00"
-        )
-        ham_metin = st.text_area("Toplu Liste", height=200, value=ornek)
-        if st.button("Toplu Listeyi Uygula", type="primary", key="toplu_kaydet"):
-            yeni_df = toplu_liste_ayristir(ham_metin)
-            if yeni_df.empty:
-                st.error("Geçerli satır bulunamadı.")
-            else:
-                st.session_state.urun_df = yeni_df
-                urunleri_kaydet(yeni_df)
-                st.success(f"{len(yeni_df)} kayıt güncellendi.")
-                st.dataframe(yeni_df, use_container_width=True)
 
 
-# ---------------------------------------------------------------------------
-# Kullanıcı paneli
-# ---------------------------------------------------------------------------
-def kullanici_paneli() -> None:
-    st.header("Hesaplama Paneli")
+def kullanici_sayfasi() -> None:
+    st.header("Malzeme Hesaplama")
 
-    if "urun_df" not in st.session_state:
-        st.session_state.urun_df = urunleri_yukle()
-
-    df = st.session_state.urun_df
-    if df.empty:
-        st.warning("Henüz ürün tanımlanmamış. Yönetim panelinden liste ekleyin.")
-        return
-
-    urun_df = df[df["TIP"] == "ÜRÜN"]
-    ayak_df = df[df["TIP"] == "AYAK"]
-
-    if urun_df.empty or ayak_df.empty:
-        st.warning("Hem ÜRÜN hem AYAK tipinde kayıt bulunmalıdır.")
-        return
-
-    # --- Ürün seçimi ---
     st.subheader("1. Ürün Seçimi")
-    urun_adlari = urun_df["ADI"].unique().tolist()
-    secilen_urun_adi = st.selectbox("Ürün (URUN_TIP = ÜRÜN)", urun_adlari)
+    uygulama_urun, urun_kayit = urun_secimi_yap("ÜRÜN", "Ürün")
+    if urun_kayit is None:
+        return
+    urun_map = urun_kaydini_map_et(urun_kayit)
 
-    urun_boy_secenekleri = urun_df[urun_df["ADI"] == secilen_urun_adi]["BOY"].tolist()
-    secilen_urun_boy = st.selectbox("Boy", urun_boy_secenekleri)
-
-    uygulama_urun = urun_df[
-        (urun_df["ADI"] == secilen_urun_adi) & (urun_df["BOY"] == secilen_urun_boy)
-    ].iloc[0]
-
-    urun_map = urun_satirindan_map_et(uygulama_urun)
-    urun_fiyat = urun_map["urun_fiyat"]
-    montaj_fiyat = urun_map["montaj_fiyat"]
-    urun_en = urun_map["urun_en"]
-    urun_boy = urun_map["urun_boy"]
-
-    with st.expander("Seçilen ürün detayı"):
-        st.write(f"**urun_fiyat** (URUN_FIYAT): {urun_fiyat:.2f}")
-        st.write(f"**montaj_fiyat** (URUN_MONTAJ): {montaj_fiyat:.2f}")
-        st.write(f"**urun_en** (URUN_EN): {urun_en:.2f}")
-        st.write(f"**urun_boy** (URUN_BOY): {urun_boy:.2f}")
-
-    # --- Ayak seçimi ---
     st.subheader("2. Ayak Seçimi")
-    ayak_adlari = ayak_df["ADI"].unique().tolist()
-    secilen_ayak_adi = st.selectbox("Ayak (URUN_TIP = AYAK)", ayak_adlari)
+    uygulama_ayak, ayak_kayit = urun_secimi_yap("AYAK", "Ayak")
+    if ayak_kayit is None:
+        return
+    ayak_map = ayak_kaydini_map_et(ayak_kayit)
 
-    ayak_boy_secenekleri = ayak_df[ayak_df["ADI"] == secilen_ayak_adi]["BOY"].tolist()
-    secilen_ayak_boy = st.selectbox("Ayak Boy", ayak_boy_secenekleri)
+    st.subheader("3. Direk Aralığı")
+    uygulama_aralik = st.selectbox("uygulama_aralik", DIREK_ARALIKLARI, index=3)
 
-    uygulama_ayak = ayak_df[
-        (ayak_df["ADI"] == secilen_ayak_adi) & (ayak_df["BOY"] == secilen_ayak_boy)
-    ].iloc[0]
-
-    ayak_map = ayak_satirindan_map_et(uygulama_ayak)
-    ayak_fiyat = ayak_map["ayak_fiyat"]
-    ayak_en = ayak_map["ayak_en"]
-    ayak_boy = ayak_map["ayak_boy"]
-
-    panjur_sayisi = hesapla_panjur_sayisi(ayak_boy, urun_boy)
-
-    with st.expander("Seçilen ayak detayı"):
-        st.write(f"**ayak_fiyat** (AYAK_FIYAT): {ayak_fiyat:.2f}")
-        st.write(f"**ayak_en** (AYAK_EN): {ayak_en:.2f}")
-        st.write(f"**ayak_boy** (AYAK_BOY): {ayak_boy:.2f}")
-        st.write(f"**panjur_sayisi** (AYAK_BOY / URUN_BOY): {panjur_sayisi:.2f}")
-
-    # --- Direk aralığı ve uzunluk ---
-    st.subheader("3. Uygulama Bilgileri")
-    uygulama_aralik = st.selectbox(
-        "Direk Aralığı (uygulama_aralik)",
-        DIREK_ARALIK_SECENEKLERI,
-        format_func=lambda x: f"{x:.2f} m",
-    )
-    uygulama_uzunluk = st.number_input(
-        "Uygulama Uzunluğu (uygulama_uzunluk)",
-        min_value=0.01,
-        value=10.0,
-        step=0.1,
-        format="%.2f",
+    st.subheader("4. Uzunluklar")
+    st.caption("Birden fazla uzunluk girebilirsiniz. Her satır ayrı hesaplanır.")
+    varsayilan = float(uygulama_aralik.replace(",", "."))
+    uzunluk_df = st.data_editor(
+        pd.DataFrame({"uygulama_uzunluk (m)": [varsayilan]}),
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "uygulama_uzunluk (m)": st.column_config.NumberColumn(
+                "uygulama_uzunluk (m)", min_value=0.1, step=0.1, format="%.2f"
+            ),
+        },
+        key="uzunluk_editor",
     )
 
-    # --- Hesaplamalar ---
-    uygulama_direk_sayisi = hesapla_direk_sayisi(uygulama_uzunluk, uygulama_aralik)
-    uygulama_urun_sayisi = hesapla_urun_sayisi(
-        uygulama_uzunluk, urun_en, urun_map["urun_adi"], panjur_sayisi
-    )
-    uygulama_iscilik = hesapla_iscilik(uygulama_uzunluk, urun_boy, montaj_fiyat)
-    uygulama_malzeme_ucreti = hesapla_malzeme_ucreti(
-        uygulama_urun_sayisi,
-        urun_boy,
-        urun_en,
-        urun_fiyat,
-        uygulama_direk_sayisi,
-        ayak_fiyat,
-    )
+    if not st.button("Hesapla", type="primary"):
+        return
 
-    # --- Sonuçlar ---
-    st.subheader("4. Sonuçlar")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("uygulama_urun_sayisi", uygulama_urun_sayisi)
-        st.metric("uygulama_uzunluk", f"{uygulama_uzunluk:.2f} m")
-    with col2:
-        st.metric("uygulama_malzeme_ucreti", f"{uygulama_malzeme_ucreti:,.2f} ₺")
-        st.metric("uygulama_iscilik", f"{uygulama_iscilik:,.2f} ₺")
-    with col3:
-        st.metric("uygulama_direk_sayisi", uygulama_direk_sayisi)
-        st.metric("panjur_sayisi", f"{panjur_sayisi:.2f}")
+    uygulama_uzunluklar = [
+        float(v)
+        for v in uzunluk_df["uygulama_uzunluk (m)"].dropna().tolist()
+        if float(v) > 0
+    ]
+    if not uygulama_uzunluklar:
+        st.error("En az bir geçerli uygulama_uzunluk girin.")
+        return
 
-    with st.expander("Hesaplama detayları"):
-        st.markdown(
-            f"""
-            | Değişken | Formül | Sonuç |
-            |----------|--------|-------|
-            | uygulama_direk_sayisi | uzunluk / aralık (küsüratlıysa ceil + 1) | {uygulama_direk_sayisi} |
-            | uygulama_urun_sayisi | ceil(uzunluk / URUN_EN) × panjur (156CM ise) | {uygulama_urun_sayisi} |
-            | uygulama_iscilik | uzunluk × URUN_BOY × montaj_fiyat | {uygulama_iscilik:,.2f} |
-            | uygulama_malzeme_ucreti | (ürün_sayısı × boy × en × fiyat) + (direk × ayak_fiyat) | {uygulama_malzeme_ucreti:,.2f} |
-            """
+    try:
+        sonuc = hesapla_coklu_maliyet(
+            uygulama_uzunluklar=uygulama_uzunluklar,
+            uygulama_aralik=uygulama_aralik,
+            urun_en=urun_map["urun_en"],
+            urun_boy=urun_map["urun_boy"],
+            urun_fiyat=urun_map["urun_fiyat"],
+            montaj_fiyat=urun_map["montaj_fiyat"],
+            ayak_boy=ayak_map["ayak_boy"],
+            ayak_fiyat=ayak_map["ayak_fiyat"],
         )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    st.subheader("Hesap Sonuçları")
+    st.caption(f"uygulama_urun: {uygulama_urun} · uygulama_ayak: {uygulama_ayak}")
+    st.metric("Panjursayısı", f"{sonuc.panjur_sayisi:,.2f}")
+
+    satir_tablosu = pd.DataFrame(
+        [
+            {
+                "Sıra": i + 1,
+                "uygulama_uzunluk (m)": s.uygulama_uzunluk,
+                "uygulama_urun_sayisi (ham)": round(s.uygulama_urun_sayisi_ham, 4),
+                "uygulama_direk_ücreti (₺)": s.uygulama_direk_ucreti,
+                "uygulama_işcilik (₺)": s.uygulama_iscilik,
+                "uygulama_direk_sayisi": s.uygulama_direk_sayisi,
+            }
+            for i, s in enumerate(sonuc.satirlar)
+        ]
+    )
+    st.dataframe(satir_tablosu, use_container_width=True, hide_index=True)
+
+    st.subheader("Genel Toplam")
+    g1, g2 = st.columns(2)
+    g1.metric(
+        "uygulama_urun_sayisi (toplam, yuvarlanmış)",
+        sonuc.toplam_urun_sayisi,
+    )
+    g2.metric("uygulama_direk_sayisi (toplam)", sonuc.toplam_direk_sayisi)
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric("uygulama_ürün_ücreti (₺)", f"{sonuc.toplam_urun_ucreti:,.2f}")
+    t2.metric("uygulama_direk_ücreti (₺)", f"{sonuc.toplam_direk_ucreti:,.2f}")
+    t3.metric("uygulama_işcilik (₺)", f"{sonuc.toplam_iscilik:,.2f}")
+
+    st.metric("Toplam Ücret (₺)", f"{sonuc.toplam_ucret:,.2f}")
 
 
-# ---------------------------------------------------------------------------
-# Ana uygulama
-# ---------------------------------------------------------------------------
 def main() -> None:
-    st.set_page_config(
-        page_title="Panjur Hesaplama",
-        page_icon="📐",
-        layout="wide",
-    )
-    st.title("Panjur / Direk Hesaplama Uygulaması")
+    st.set_page_config(page_title="Malzeme Hesaplama", page_icon="📐", layout="wide")
+    ornek_veri_yukle()
 
-    sayfa = st.sidebar.radio(
-        "Sayfa",
-        ["Kullanıcı", "Yönetim"],
-        index=0,
-    )
+    st.sidebar.markdown(f"### Sürüm **{UYGULAMA_SURUM}**")
+    sayfa = st.sidebar.radio("Menü", ["Kullanıcı", "Yönetim"])
 
+    st.title("Malzeme Hesaplama Uygulaması")
     if sayfa == "Yönetim":
-        yonetim_paneli()
+        yonetim_sayfasi()
     else:
-        kullanici_paneli()
+        kullanici_sayfasi()
 
 
 if __name__ == "__main__":
